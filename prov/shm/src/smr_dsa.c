@@ -35,6 +35,7 @@
 #endif /* HAVE_CONFIG_H */
 
 #include "smr.h"
+#include <immintrin.h> // _mm_pause
 
 #if SHM_HAVE_DSA
 
@@ -90,9 +91,12 @@ struct smr_dsa_context {
 
 	struct dsa_bitmap dsa_bitmap;
 	void *wq_portal[MAX_WQS_PER_EP];
+	int wq_fd[MAX_WQS_PER_EP];
 	int wq_count;
 	int next_wq;
 	int enable_dsa_page_touch;
+	bool wq_mmap_support;
+	bool wq_write_support;
 
 	unsigned long copy_type_stats[2];
 	unsigned long page_fault_stats[2];
@@ -148,16 +152,26 @@ static inline unsigned char dsa_enqcmd(struct dsa_hw_desc *desc,
 static __always_inline void dsa_desc_submit(struct smr_dsa_context *dsa_context,
 					    struct dsa_hw_desc *hw)
 {
-	int enq_status;
+	int ret, enq_status;
 
 	// make sure writes (e.g., comp.status = 0) are ordered wrt to enqcmd
 	{ asm volatile("sfence":::"memory"); }
 
 	do {
-		enq_status = dsa_enqcmd(hw,
+		if (dsa_context->wq_mmap_support)
+			enq_status = dsa_enqcmd(
+				hw,
 				dsa_context->wq_portal[dsa_context->next_wq]);
-		dsa_context->next_wq = (dsa_context->next_wq + 1) %
-			(dsa_context->wq_count);
+		else if (dsa_context->wq_write_support) {
+			ret = write(dsa_context->wq_fd[dsa_context->next_wq],
+				    hw, sizeof(*hw)); 
+			enq_status = ret != sizeof(*hw) ? -1 : 0;
+		}
+		else
+			assert(0);
+
+		dsa_context->next_wq =
+			(dsa_context->next_wq + 1) % (dsa_context->wq_count);
 	} while (enq_status);
 }
 
@@ -185,6 +199,37 @@ static int dsa_open_wq(struct accfg_wq *wq)
 	return fd;
 }
 
+static bool dsa_write_is_supported(int fd) 
+{
+	int ret;
+	int max_comp_checks = 65536; 
+	struct dsa_hw_desc desc __attribute__((aligned(64))) = {0};
+	struct dsa_completion_record comp __attribute__((aligned(32)));
+	memset(&comp, 0, sizeof(comp));
+	
+	desc.opcode = DSA_OPCODE_NOOP;
+	desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
+	desc.completion_addr = (unsigned long) &comp;
+
+	// make sure writes (e.g., comp.status = 0) are ordered wrt to write()
+	{ asm volatile("sfence":::"memory"); }
+
+	ret = write(fd, &desc, sizeof(desc));
+	
+	if (ret != sizeof(desc))
+		return false;
+
+	while (comp.status == 0 && max_comp_checks > 0) {
+		max_comp_checks--;
+		_mm_pause();
+	}
+
+	if (comp.status == DSA_COMP_SUCCESS)
+		return true;
+
+	return false;
+}
+
 static void *dsa_idxd_wq_mmap(struct accfg_wq *wq)
 {
 	int fd;
@@ -197,11 +242,28 @@ static void *dsa_idxd_wq_mmap(struct accfg_wq *wq)
 	close(fd);
 
 	if (wq_reg == MAP_FAILED) {
-		FI_WARN(&smr_prov, FI_LOG_EP_CTRL, "d_idxd_wq_mmap error\n");
 		return NULL;
 	}
 
 	return wq_reg;
+}
+
+static int dsa_idxd_wq_fd(struct accfg_wq *wq, bool check_write_support)
+{
+	int fd;
+
+	fd = dsa_open_wq(wq);
+
+	if (fd < 0)
+		return fd;
+
+	if (check_write_support == true) {
+		if (!dsa_write_is_supported(fd)) {
+			close(fd);
+			return -1;
+		} 
+	}
+	return fd;
 }
 
 static void dsa_idxd_wq_unmap(void *wq)
@@ -210,17 +272,22 @@ static void dsa_idxd_wq_unmap(void *wq)
 }
 
 static int dsa_idxd_init_wq_array(int shared, int numa_node,
-				  void **wq_array)
+				  struct smr_dsa_context *dsa_context)
 {
 	static struct accfg_ctx *ctx;
 	struct accfg_wq *wq;
 	void *wq_reg;
+	int fd;
 	enum accfg_device_state dstate;
 	enum accfg_wq_state wstate;
 	enum accfg_wq_type type;
 	int mode;
 	int wq_count = 0;
 	struct accfg_device *device;
+	void **mmapped_wq = dsa_context->wq_portal; 
+	int *wq_fd = dsa_context->wq_fd; 
+	dsa_context->wq_mmap_support = 1;
+	dsa_context->wq_write_support = 0;
 
 	if ((*dsa_ops.accfg_new)(&ctx) < 0)
 		return 0;
@@ -267,12 +334,30 @@ static int dsa_idxd_init_wq_array(int shared, int numa_node,
 					"DSA WQ: %s\n",
 					(*dsa_ops.accfg_wq_get_devname)(wq));
 
-			wq_reg = dsa_idxd_wq_mmap(wq);
-			if (wq_reg == NULL)
-				continue;
-			wq_array[wq_count] = wq_reg;
-			wq_count++;
-			break;
+			fd = -1;
+			wq_reg = NULL;
+
+			if (dsa_context->wq_mmap_support ==  1) {
+				wq_reg = dsa_idxd_wq_mmap(wq);
+				if (wq_reg == NULL && wq_count == 0) {
+					dsa_context->wq_mmap_support = 0;
+					dsa_context->wq_write_support = 1;
+				} 
+			}
+
+			if (dsa_context->wq_write_support == 1) {
+				fd = dsa_idxd_wq_fd(wq, wq_count == 0);
+				if (fd < 0 && wq_count == 0)
+					dsa_context->wq_write_support = 0;
+			}
+
+			if (wq_reg != NULL || fd >= 0 ) {
+				mmapped_wq[wq_count] = wq_reg;
+				wq_fd[wq_count] = fd;
+				wq_count++;
+				break;
+			}
+
 		}
 
 		if (wq_count >= MAX_WQS_PER_EP)
@@ -854,12 +939,11 @@ void smr_dsa_context_init(struct smr_ep *ep)
 	fi_param_get_bool(&smr_prov, "enable_dsa_page_touch",
 			  &enable_dsa_page_touch);
 
-	wq_count = dsa_idxd_init_wq_array(1, numa_node,
-				      dsa_context->wq_portal);
+	wq_count = dsa_idxd_init_wq_array(1, numa_node, dsa_context);
 
 	if (wq_count == 0) {
 		FI_WARN(&smr_prov, FI_LOG_EP_CTRL,
-			 "error calling dsa_idxd_init_wq_array()\n");
+			 "error: wq mmap and wq write not supported\n");
 		goto wq_get_error;
 	}
 
@@ -903,8 +987,14 @@ void smr_dsa_context_cleanup(struct smr_ep *ep)
 			"Warning: TBD outstanding DSA commands while "
 			"doing cleanup\n");
 
-	for (i = 0; i < dsa_context->wq_count; i++)
-		dsa_idxd_wq_unmap(dsa_context->wq_portal[i]);
+	for (i = 0; i < dsa_context->wq_count; i++) {
+		if (dsa_context->wq_mmap_support)
+			dsa_idxd_wq_unmap(dsa_context->wq_portal[i]);
+		else if (dsa_context->wq_write_support)
+			close(dsa_context->wq_fd[i]);
+		else
+			assert(0);
+	}
 
 	free(ep->dsa_context);
 }
